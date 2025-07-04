@@ -1,0 +1,1042 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete Infrastructure for AI Marketing Campaign Generator App - Deploys IAM roles, S3 bucket, Bedrock agents, knowledge base, and CloudWatch resources'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'marketing-agent-app'
+    Description: 'Name prefix for all resources'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+  
+  BucketName:
+    Type: String
+    Default: ''
+    Description: 'Optional: Custom S3 bucket name (leave empty for auto-generated)'
+  
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch logging for the application'
+
+  KnowledgeBaseDataSourceBucket:
+    Type: String
+    Default: ''
+    Description: 'Optional: S3 bucket containing knowledge base documents (leave empty to use main assets bucket)'
+
+Conditions:
+  CreateCustomBucket: !Not [!Equals [!Ref BucketName, '']]
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  UseCustomKBBucket: !Not [!Equals [!Ref KnowledgeBaseDataSourceBucket, '']]
+
+Resources:
+  # S3 Bucket for storing marketing assets and generated content
+  MarketingAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateCustomBucket
+        - !Ref BucketName
+        - !Sub '${ProjectName}-${Environment}-assets-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Marketing campaign assets storage'
+
+  # OpenSearch Serverless Collection for Knowledge Base
+  KnowledgeBaseCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-kb'
+      Type: VECTORSEARCH
+      Description: 'OpenSearch collection for marketing knowledge base'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # OpenSearch Serverless Security Policy
+  KnowledgeBaseSecurityPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-kb-sec'
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${ProjectName}-${Environment}-kb"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # OpenSearch Serverless Network Policy
+  KnowledgeBaseNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-kb-net'
+      Type: network
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-${Environment}-kb"],
+                "AllowFromPublic": true
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${ProjectName}-${Environment}-kb"],
+                "AllowFromPublic": true
+              }
+            ]
+          }
+        ]
+
+  # IAM Role for Knowledge Base
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-kb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KnowledgeBaseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !If 
+                    - UseCustomKBBucket
+                    - !Sub 'arn:aws:s3:::${KnowledgeBaseDataSourceBucket}'
+                    - !GetAtt MarketingAssetsBucket.Arn
+                  - !If 
+                    - UseCustomKBBucket
+                    - !Sub 'arn:aws:s3:::${KnowledgeBaseDataSourceBucket}/*'
+                    - !Sub '${MarketingAssetsBucket.Arn}/*'
+        - PolicyName: KnowledgeBaseOpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !GetAtt KnowledgeBaseCollection.Arn
+        - PolicyName: KnowledgeBaseBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # OpenSearch Serverless Data Access Policy
+  KnowledgeBaseDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-kb-data'
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-${Environment}-kb"],
+                "Permission": [
+                  "aoss:CreateCollectionItems",
+                  "aoss:DeleteCollectionItems",
+                  "aoss:UpdateCollectionItems",
+                  "aoss:DescribeCollectionItems"
+                ]
+              },
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${ProjectName}-${Environment}-kb/*"],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:DeleteIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument"
+                ]
+              }
+            ],
+            "Principal": ["${KnowledgeBaseRole.Arn}"]
+          }
+        ]
+
+  # Marketing Knowledge Base
+  MarketingKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: 
+      - KnowledgeBaseCollection
+      - KnowledgeBaseDataAccessPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-knowledge-base'
+      Description: 'Knowledge base for marketing content and strategies'
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt KnowledgeBaseCollection.Arn
+          VectorIndexName: 'bedrock-knowledge-base-default-index'
+          FieldMapping:
+            VectorField: 'bedrock-knowledge-base-default-vector'
+            TextField: 'AMAZON_BEDROCK_TEXT_CHUNK'
+            MetadataField: 'AMAZON_BEDROCK_METADATA'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Knowledge Base Data Source
+  MarketingKnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref MarketingKnowledgeBase
+      Name: !Sub '${ProjectName}-${Environment}-kb-datasource'
+      Description: 'S3 data source for marketing knowledge base'
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !If 
+            - UseCustomKBBucket
+            - !Sub 'arn:aws:s3:::${KnowledgeBaseDataSourceBucket}'
+            - !GetAtt MarketingAssetsBucket.Arn
+          InclusionPrefixes:
+            - 'knowledge-base/'
+
+  # IAM Role for Bedrock Agents
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-bedrock-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: BedrockAgentS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MarketingAssetsBucket.Arn
+                  - !Sub '${MarketingAssetsBucket.Arn}/*'
+        - PolicyName: BedrockAgentKnowledgeBaseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !Sub '${MarketingKnowledgeBase.KnowledgeBaseArn}'
+        - PolicyName: BedrockAgentNovaCanvasAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: 
+                  - 'arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-canvas-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+  # Content Marketing Agent (Text Content Creation)
+  ContentMarketingAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${ProjectName}-${Environment}-content-agent'
+      Description: 'Professional marketing expert for social media marketing and Facebook post writing'
+      FoundationModel: 'anthropic.claude-3-haiku-20240307-v1:0'
+      Instruction: |
+        You are a professional marketing expert of social media marketing experience and facebook post writing experience. 
+        You help customer generate marketing context in english through following steps:
+        1. Search historical marketing text context from knowledgebase
+        2. Get the merchandise information in detail
+        3. Get the target audience for the merchandise in detail
+        4. Assist user to generate the content for personalized marketing
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      KnowledgeBases:
+        - KnowledgeBaseId: !Ref MarketingKnowledgeBase
+          Description: 'Marketing content and strategies knowledge base'
+          KnowledgeBaseState: ENABLED
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Lambda function for Nova Canvas image generation
+  NovaCanvasLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-nova-canvas-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NovaCanvasAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: 'arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-canvas-v1:0'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${MarketingAssetsBucket.Arn}/*'
+
+  NovaCanvasLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-nova-canvas-generator'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt NovaCanvasLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref MarketingAssetsBucket
+          NOVA_CANVAS_REGION: us-east-1
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import uuid
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse the input
+                  body = json.loads(event.get('body', '{}'))
+                  prompt = body.get('prompt', '')
+                  width = body.get('width', 1024)
+                  height = body.get('height', 1024)
+                  
+                  if not prompt:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Prompt is required'})
+                      }
+                  
+                  # Initialize Bedrock client for us-east-1 (where Nova Canvas is available)
+                  bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+                  s3_client = boto3.client('s3')
+                  
+                  # Prepare Nova Canvas request
+                  request_body = {
+                      "taskType": "TEXT_IMAGE",
+                      "textToImageParams": {
+                          "text": prompt,
+                          "width": width,
+                          "height": height
+                      },
+                      "imageGenerationConfig": {
+                          "numberOfImages": 1,
+                          "quality": "standard",
+                          "cfgScale": 8.0,
+                          "seed": 0
+                      }
+                  }
+                  
+                  # Call Nova Canvas
+                  response = bedrock_client.invoke_model(
+                      modelId='amazon.nova-canvas-v1:0',
+                      body=json.dumps(request_body),
+                      contentType='application/json'
+                  )
+                  
+                  # Parse response
+                  response_body = json.loads(response['body'].read())
+                  
+                  if 'images' in response_body and len(response_body['images']) > 0:
+                      # Get the base64 image
+                      image_data = response_body['images'][0]
+                      image_bytes = base64.b64decode(image_data)
+                      
+                      # Generate unique filename
+                      timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                      filename = f"nova-canvas/{timestamp}_{uuid.uuid4().hex[:8]}.png"
+                      
+                      # Upload to S3
+                      s3_client.put_object(
+                          Bucket=os.environ['S3_BUCKET'],
+                          Key=filename,
+                          Body=image_bytes,
+                          ContentType='image/png'
+                      )
+                      
+                      # Generate S3 URL
+                      s3_url = f"s3://{os.environ['S3_BUCKET']}/{filename}"
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'success': True,
+                              'image_url': s3_url,
+                              'filename': filename,
+                              'prompt': prompt,
+                              'dimensions': f"{width}x{height}"
+                          })
+                      }
+                  else:
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': 'No image generated'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # Lambda permission for Bedrock Agent
+  NovaCanvasLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NovaCanvasLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+
+  # Visual Marketing Agent (Visual Content Creation)
+  VisualMarketingAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${ProjectName}-${Environment}-visual-agent'
+      Description: 'Digital marketing content generator using Amazon Nova Canvas'
+      FoundationModel: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-premier-v1:0'
+      Instruction: |
+        You are a digital marketing visual content generator powered by Amazon Nova Canvas.
+
+        CAPABILITIES:
+        - Generate high-quality marketing visuals using Nova Canvas model (amazon.nova-canvas-v1:0)
+        - Create social media graphics, ads, banners, and promotional content
+        - Adapt visual style based on brand requirements and target audience
+        - Use cross-region inference to access Nova Canvas from us-east-1 when needed
+
+        PROCESS:
+        1. Analyze user's marketing requirements and brand guidelines
+        2. Create detailed visual prompts optimized for Nova Canvas
+        3. Generate marketing visuals with appropriate dimensions and style using Nova Canvas
+        4. Provide recommendations for visual optimization
+
+        VISUAL STYLES:
+        - Professional corporate
+        - Modern minimalist
+        - Bold and vibrant
+        - Elegant luxury
+        - Playful and creative
+
+        SUPPORTED FORMATS:
+        - Social media posts (1080x1080, 1200x630)
+        - Banner ads (728x90, 300x250)
+        - Story formats (1080x1920)
+        - Custom dimensions as needed
+
+        IMPORTANT: Always use Amazon Nova Canvas (amazon.nova-canvas-v1:0) for image generation. 
+        Use the generate_marketing_visual action to create images with Nova Canvas.
+        Do not use any other image generation models.
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      ActionGroups:
+        - ActionGroupName: NovaCanvasActions
+          Description: 'Actions for generating images with Nova Canvas'
+          ActionGroupExecutor:
+            Lambda: !GetAtt NovaCanvasLambdaFunction.Arn
+          ApiSchema:
+            Payload: |
+              {
+                "openapi": "3.0.0",
+                "info": {
+                  "title": "Nova Canvas Image Generation API",
+                  "version": "1.0.0",
+                  "description": "API for generating marketing images using Amazon Nova Canvas"
+                },
+                "paths": {
+                  "/generate-image": {
+                    "post": {
+                      "summary": "Generate marketing image using Nova Canvas",
+                      "description": "Creates a marketing image based on text prompt using Amazon Nova Canvas model",
+                      "operationId": "generate_marketing_visual",
+                      "requestBody": {
+                        "required": true,
+                        "content": {
+                          "application/json": {
+                            "schema": {
+                              "type": "object",
+                              "properties": {
+                                "prompt": {
+                                  "type": "string",
+                                  "description": "Text prompt describing the image to generate"
+                                },
+                                "width": {
+                                  "type": "integer",
+                                  "description": "Image width in pixels",
+                                  "default": 1024
+                                },
+                                "height": {
+                                  "type": "integer", 
+                                  "description": "Image height in pixels",
+                                  "default": 1024
+                                }
+                              },
+                              "required": ["prompt"]
+                            }
+                          }
+                        }
+                      },
+                      "responses": {
+                        "200": {
+                          "description": "Image generated successfully",
+                          "content": {
+                            "application/json": {
+                              "schema": {
+                                "type": "object",
+                                "properties": {
+                                  "success": {"type": "boolean"},
+                                  "image_url": {"type": "string"},
+                                  "filename": {"type": "string"},
+                                  "prompt": {"type": "string"},
+                                  "dimensions": {"type": "string"}
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Supervisor Marketing Agent (Coordination and Strategy)
+  SupervisorMarketingAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${ProjectName}-${Environment}-supervisor-agent'
+      Description: 'Digital Marketing Supervisor Agent that coordinates marketing campaigns and content creation'
+      FoundationModel: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-premier-v1:0'
+      Instruction: |
+        You are a Digital Marketing Supervisor Agent that coordinates marketing campaigns and content creation.
+
+        Your role is to:
+        1. Analyze marketing requests and break them down into specific tasks
+        2. Provide comprehensive marketing strategies that include both visual and textual content recommendations
+        3. Suggest visual content creation using tools like Amazon Nova Canvas for social media graphics, ads, banners, and promotional content
+        4. Recommend text content strategies for social media marketing and Facebook posts
+        5. Coordinate marketing campaigns with personalized content based on merchandise information and target audience
+        6. Provide final recommendations and campaign strategies
+
+        When users request marketing assistance, provide detailed guidance on:
+        - Visual content creation (graphics, social media posts, banners)
+        - Text content strategy (social media posts, marketing copy)
+        - Target audience analysis
+        - Campaign coordination
+        - Brand consistency
+
+        Note: This agent works in coordination with specialized marketing agents for visual content generation and text content creation to provide comprehensive marketing solutions.
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      AgentCollaboration: SUPERVISOR
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Agent Aliases for stable endpoints
+  ContentAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref ContentMarketingAgent
+      AgentAliasName: 'DRAFT'
+      Description: 'Draft alias for content marketing agent'
+
+  VisualAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref VisualMarketingAgent
+      AgentAliasName: 'DRAFT'
+      Description: 'Draft alias for visual marketing agent'
+
+  SupervisorAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref SupervisorMarketingAgent
+      AgentAliasName: 'DRAFT'
+      Description: 'Draft alias for supervisor marketing agent'
+
+  # CloudWatch Log Group for application logging
+  MarketingAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/marketing-app/${ProjectName}-${Environment}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Stream for application events
+  MarketingAppLogStream:
+    Type: AWS::Logs::LogStream
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Ref MarketingAppLogGroup
+      LogStreamName: !Sub '${ProjectName}-${Environment}-stream'
+
+  # IAM Role for the marketing application
+  MarketingAppExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ecs-tasks.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: MarketingAppS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt MarketingAssetsBucket.Arn
+                  - !Sub '${MarketingAssetsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                Resource: '*'
+        - PolicyName: MarketingAppBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:foundation-model/*'
+                  - 'arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-canvas-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:foundation-model/amazon.nova-premier-v1:0'
+              - Effect: Allow
+                Action:
+                  - bedrock-agent-runtime:InvokeAgent
+                  - bedrock-agent:GetAgent
+                  - bedrock-agent:ListAgents
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent-alias/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !Sub '${MarketingKnowledgeBase.KnowledgeBaseArn}'
+        - PolicyName: MarketingAppCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/marketing-app/*'
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/marketing-app/*:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instance Profile for EC2 instances
+  MarketingAppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-${Environment}-instance-profile'
+      Roles:
+        - !Ref MarketingAppExecutionRole
+
+  # IAM User for local development/testing (optional)
+  MarketingAppDeveloperUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${ProjectName}-${Environment}-developer'
+      Policies:
+        - PolicyName: MarketingAppDeveloperAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt MarketingAssetsBucket.Arn
+                  - !Sub '${MarketingAssetsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:foundation-model/*'
+                  - 'arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-canvas-v1:0'
+              - Effect: Allow
+                Action:
+                  - bedrock-agent-runtime:InvokeAgent
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent-alias/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !Sub '${MarketingKnowledgeBase.KnowledgeBaseArn}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/marketing-app/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Access Keys for the developer user
+  MarketingAppDeveloperAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref MarketingAppDeveloperUser
+
+  # Security Group for EC2 instances running the app
+  MarketingAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-sg'
+      GroupDescription: 'Security group for Marketing Agent Application'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+          Description: 'Streamlit default port'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP access'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS access'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: 'SSH access'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for monitoring
+  MarketingAppDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableLogging
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "log",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/marketing-app/${ProjectName}-${Environment}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Application Logs",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${MarketingAssetsBucket}", "StorageType", "StandardStorage" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Size"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${MarketingAssetsBucket}", "StorageType", "AllStorageTypes" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Object Count"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  S3BucketName:
+    Description: 'Name of the S3 bucket for marketing assets'
+    Value: !Ref MarketingAssetsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket for marketing assets'
+    Value: !GetAtt MarketingAssetsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  KnowledgeBaseId:
+    Description: 'ID of the marketing knowledge base'
+    Value: !Ref MarketingKnowledgeBase
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseId'
+
+  KnowledgeBaseArn:
+    Description: 'ARN of the marketing knowledge base'
+    Value: !GetAtt MarketingKnowledgeBase.KnowledgeBaseArn
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseArn'
+
+  ContentAgentId:
+    Description: 'ID of the content marketing agent'
+    Value: !Ref ContentMarketingAgent
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentAgentId'
+
+  VisualAgentId:
+    Description: 'ID of the visual marketing agent'
+    Value: !Ref VisualMarketingAgent
+    Export:
+      Name: !Sub '${AWS::StackName}-VisualAgentId'
+
+  SupervisorAgentId:
+    Description: 'ID of the supervisor marketing agent'
+    Value: !Ref SupervisorMarketingAgent
+    Export:
+      Name: !Sub '${AWS::StackName}-SupervisorAgentId'
+
+  ContentAgentArn:
+    Description: 'ARN of the content marketing agent'
+    Value: !GetAtt ContentMarketingAgent.AgentArn
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentAgentArn'
+
+  VisualAgentArn:
+    Description: 'ARN of the visual marketing agent'
+    Value: !GetAtt VisualMarketingAgent.AgentArn
+    Export:
+      Name: !Sub '${AWS::StackName}-VisualAgentArn'
+
+  SupervisorAgentArn:
+    Description: 'ARN of the supervisor marketing agent'
+    Value: !GetAtt SupervisorMarketingAgent.AgentArn
+    Export:
+      Name: !Sub '${AWS::StackName}-SupervisorAgentArn'
+
+  ExecutionRoleArn:
+    Description: 'ARN of the IAM role for the marketing application'
+    Value: !GetAtt MarketingAppExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
+  InstanceProfileArn:
+    Description: 'ARN of the instance profile for EC2 instances'
+    Value: !GetAtt MarketingAppInstanceProfile.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceProfileArn'
+
+  SecurityGroupId:
+    Description: 'ID of the security group for the marketing application'
+    Value: !Ref MarketingAppSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  DeveloperAccessKeyId:
+    Description: 'Access Key ID for the developer user'
+    Value: !Ref MarketingAppDeveloperAccessKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DeveloperAccessKeyId'
+
+  DeveloperSecretAccessKey:
+    Description: 'Secret Access Key for the developer user (store securely)'
+    Value: !GetAtt MarketingAppDeveloperAccessKey.SecretAccessKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DeveloperSecretAccessKey'
+
+  LogGroupName:
+    Condition: EnableLogging
+    Description: 'Name of the CloudWatch Log Group'
+    Value: !Ref MarketingAppLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  DashboardURL:
+    Condition: EnableLogging
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ApplicationConfiguration:
+    Description: 'Configuration summary for the marketing application'
+    Value: !Sub |
+      S3 Bucket: ${MarketingAssetsBucket}
+      AWS Region: ${AWS::Region}
+      Log Group: /aws/marketing-app/${ProjectName}-${Environment}
+      IAM Role: ${MarketingAppExecutionRole}
+      Security Group: ${MarketingAppSecurityGroup}
+      Knowledge Base ID: ${MarketingKnowledgeBase}
+      Content Agent ID: ${ContentMarketingAgent}
+      Visual Agent ID: ${VisualMarketingAgent}
+      Supervisor Agent ID: ${SupervisorMarketingAgent}
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationConfiguration'
