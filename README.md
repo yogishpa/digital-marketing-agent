@@ -28,7 +28,7 @@ A comprehensive marketing application built with AWS services, featuring AI-powe
 
 1. **Clone this repository**
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/yogishpa/digital-marketing-agent.git
    cd marketing_app
    ```
 
